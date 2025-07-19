@@ -1,55 +1,77 @@
-
 #!/bin/bash
+set -e
 
-echo -e "\033[1;36m======== BBRPlus + NGINX + Cloudflare 优化安装脚本 ========\033[0m"
-echo -e "\033[1;32m[信息] 当前系统内核版本：$(uname -r)\033[0m"
+GREEN="\033[1;32m"
+CYAN="\033[1;36m"
+YELLOW="\033[1;33m"
+NC="\033[0m"
 
-read -p "是否继续安装 BBRPlus 并配置 NGINX 优化？[Y/N]: " confirm
-if [[ $confirm != "Y" && $confirm != "y" ]]; then
-    echo "操作取消。"
-    exit 1
+echo -e "${CYAN}======== BBRPlus DKMS + NGINX + Cloudflare 优化一键安装脚本 ========${NC}"
+echo -e "${GREEN}当前系统内核版本：$(uname -r)${NC}"
+
+read -p "是否继续安装 BBRPlus DKMS 模块并配置 NGINX 优化？[Y/N]: " confirm
+if [[ ! $confirm =~ ^[Yy]$ ]]; then
+  echo -e "${YELLOW}操作已取消${NC}"
+  exit 1
 fi
 
-# Step 1: 备份 grub 配置
-echo "[备份] 当前 grub 默认配置..."
-cp /etc/default/grub /etc/default/grub.bak
+echo -e "${GREEN}[1/10] 安装依赖包：dkms、build-essential、linux-headers、wget、unzip ...${NC}"
+sudo apt update
+sudo apt install -y dkms build-essential linux-headers-$(uname -r) wget unzip nginx
 
-# Step 2: 下载 BBRPlus 内核
-echo "[下载] BBRPlus 5.10.127 内核..."
-wget -O linux-image-5.10.127-bbrplus.deb https://github.com/chiakge/Linux-NetSpeed/releases/download/v2022.06.06/linux-image-5.10.127-bbrplus_1.0_amd64.deb
-
-if [[ ! -f linux-image-5.10.127-bbrplus.deb ]]; then
-    echo "[错误] 内核下载失败，请检查网络或链接。"
-    exit 1
+echo -e "${GREEN}[2/10] 清理旧的 BBRPlus DKMS 模块（如果有）...${NC}"
+if dkms status | grep -q "tcp_bbrplus"; then
+  sudo dkms remove tcp_bbrplus/0.1 --all || true
+  sudo rm -rf /usr/src/tcp_bbrplus-0.1
+  echo -e "${GREEN}旧模块已删除${NC}"
+else
+  echo -e "${GREEN}无旧模块，跳过删除${NC}"
 fi
 
-# Step 3: 安装内核
-echo "[安装] 内核中..."
-dpkg -i linux-image-5.10.127-bbrplus.deb
+echo -e "${GREEN}[3/10] 下载 BBRPlus DKMS 源码 ZIP ...${NC}"
+TMPDIR=$(mktemp -d)
+wget -qO "$TMPDIR/tcp_bbrplus.zip" https://github.com/KozakaiAya/TCP_BBR/archive/refs/heads/master.zip
 
-# Step 4: 更新 grub
-echo "[更新] grub..."
-update-grub
+echo -e "${GREEN}[4/10] 解压源码到 /usr/src/tcp_bbrplus-0.1 ...${NC}"
+sudo rm -rf /usr/src/tcp_bbrplus-0.1
+sudo unzip -q "$TMPDIR/tcp_bbrplus.zip" -d /usr/src/
+sudo mv /usr/src/TCP_BBR-master /usr/src/tcp_bbrplus-0.1
+rm -rf "$TMPDIR"
 
-# Step 5: 设置 TCP 拥塞算法为 bbrplus
-echo "[配置] TCP 加速参数..."
-cat << EOF2 | tee -a /etc/sysctl.conf
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbrplus
-EOF2
+echo -e "${GREEN}[5/10] 生成 dkms.conf 文件...${NC}"
+sudo tee /usr/src/tcp_bbrplus-0.1/dkms.conf > /dev/null << EOF
+PACKAGE_NAME="tcp_bbrplus"
+PACKAGE_VERSION="0.1"
+MAKE[0]="make -C ./code tcp_bbrplus.ko"
+BUILT_MODULE_NAME[0]="tcp_bbrplus"
+DEST_MODULE_LOCATION[0]="/kernel/net/ipv4/"
+AUTOINSTALL="yes"
+EOF
 
-sysctl -p
+echo -e "${GREEN}[6/10] 添加 DKMS 模块...${NC}"
+sudo dkms add -m tcp_bbrplus -v 0.1
 
-# Step 6: 安装 NGINX
-echo "[安装] NGINX..."
-apt update && apt install -y nginx
+echo -e "${GREEN}[7/10] 编译并安装 DKMS 模块...${NC}"
+sudo dkms build -m tcp_bbrplus -v 0.1
+sudo dkms install -m tcp_bbrplus -v 0.1
 
-# Step 7: 优化 NGINX 配置
-echo "[优化] NGINX..."
-cat << EOF3 > /etc/nginx/conf.d/optim.conf
+echo -e "${GREEN}[8/10] 加载 bbrplus 模块并设置 TCP 拥塞控制...${NC}"
+sudo modprobe tcp_bbrplus
+
+if ! grep -q "tcp_bbrplus" /etc/sysctl.conf; then
+  echo -e "\n# BBRPlus 配置" | sudo tee -a /etc/sysctl.conf
+  echo "net.core.default_qdisc = fq" | sudo tee -a /etc/sysctl.conf
+  echo "net.ipv4.tcp_congestion_control = tcp_bbrplus" | sudo tee -a /etc/sysctl.conf
+fi
+
+sudo sysctl -p
+
+echo -e "${GREEN}[9/10] 优化 NGINX 配置，启用 gzip 和 Cloudflare 真实 IP 支持...${NC}"
+sudo tee /etc/nginx/conf.d/optim.conf > /dev/null << EOF
 server {
     listen 80 default_server;
     server_name _;
+
     location / {
         root /var/www/html;
         index index.html;
@@ -60,6 +82,7 @@ server {
     gzip_vary on;
     gzip_min_length 1024;
 
+    # Cloudflare IP段列表
     set_real_ip_from 103.21.244.0/22;
     set_real_ip_from 103.22.200.0/22;
     set_real_ip_from 103.31.4.0/22;
@@ -77,13 +100,11 @@ server {
     set_real_ip_from 198.41.128.0/17;
     real_ip_header CF-Connecting-IP;
 }
-EOF3
+EOF
 
-systemctl restart nginx
+sudo systemctl restart nginx
 
-# Step 8: 显示验证信息
-echo -e "\n\033[1;34m[完成] 所有操作已执行，请输入以下命令验证：\033[0m"
-echo -e "1. uname -r"
-echo -e "2. sysctl net.ipv4.tcp_congestion_control"
-echo -e "3. nginx -v"
-echo -e "\033[1;33m请执行 sudo reboot 重启系统以应用新内核。\033[0m"
+echo -e "${GREEN}[10/10] 安装完成！${NC}"
+echo -e "${GREEN}当前 TCP 拥塞控制算法：$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')${NC}"
+echo -e "${GREEN}NGINX 版本：$(nginx -v 2>&1)${NC}"
+echo -e "${YELLOW}建议重启系统确保内核模块完全生效：sudo reboot${NC}"
