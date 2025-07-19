@@ -1,55 +1,31 @@
-
 #!/bin/bash
+set -euo pipefail
 
-echo -e "\033[1;36m======== BBRPlus + NGINX + Cloudflare 优化安装脚本 ========\033[0m"
-echo -e "\033[1;32m[信息] 当前系统内核版本：$(uname -r)\033[0m"
+LOGFILE="/var/log/bbrplus_ngx_install.log"
+exec > >(tee -a "$LOGFILE") 2>&1
 
-read -p "是否继续安装 BBRPlus 并配置 NGINX 优化？[Y/N]: " confirm
-if [[ $confirm != "Y" && $confirm != "y" ]]; then
-    echo "操作取消。"
-    exit 1
-fi
+GREEN="\033[1;32m"
+CYAN="\033[1;36m"
+YELLOW="\033[1;33m"
+NC="\033[0m"
 
-# Step 1: 备份 grub 配置
-echo "[备份] 当前 grub 默认配置..."
-cp /etc/default/grub /etc/default/grub.bak
+log(){ echo -e "$1"; }
 
-# Step 2: 下载 BBRPlus 内核
-echo "[下载] BBRPlus 5.10.127 内核..."
-wget -O linux-image-5.10.127-bbrplus.deb https://github.com/chiakge/Linux-NetSpeed/releases/download/v2022.06.06/linux-image-5.10.127-bbrplus_1.0_amd64.deb
+log "${CYAN}======== BBRPlus DKMS + NGINX + Cloudflare 优化一键脚本 ========${NC}"
+log "当前系统内核：$(uname -r)"
 
-if [[ ! -f linux-image-5.10.127-bbrplus.deb ]]; then
-    echo "[错误] 内核下载失败，请检查网络或链接。"
-    exit 1
-fi
+# 安装 NGINX
+log "${GREEN}[1/4] 安装 NGINX...${NC}"
+sudo apt update -y
+sudo apt install -y nginx || { log "NGINX 安装失败"; exit 1; }
 
-# Step 3: 安装内核
-echo "[安装] 内核中..."
-dpkg -i linux-image-5.10.127-bbrplus.deb
-
-# Step 4: 更新 grub
-echo "[更新] grub..."
-update-grub
-
-# Step 5: 设置 TCP 拥塞算法为 bbrplus
-echo "[配置] TCP 加速参数..."
-cat << EOF2 | tee -a /etc/sysctl.conf
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbrplus
-EOF2
-
-sysctl -p
-
-# Step 6: 安装 NGINX
-echo "[安装] NGINX..."
-apt update && apt install -y nginx
-
-# Step 7: 优化 NGINX 配置
-echo "[优化] NGINX..."
-cat << EOF3 > /etc/nginx/conf.d/optim.conf
+# 配置 NGINX 优化
+log "${GREEN}[2/4] 写入 optim.conf...${NC}"
+sudo tee /etc/nginx/conf.d/optim.conf > /dev/null << 'EOF'
 server {
     listen 80 default_server;
     server_name _;
+
     location / {
         root /var/www/html;
         index index.html;
@@ -60,6 +36,7 @@ server {
     gzip_vary on;
     gzip_min_length 1024;
 
+    # Cloudflare IP 段
     set_real_ip_from 103.21.244.0/22;
     set_real_ip_from 103.22.200.0/22;
     set_real_ip_from 103.31.4.0/22;
@@ -77,13 +54,9 @@ server {
     set_real_ip_from 198.41.128.0/17;
     real_ip_header CF-Connecting-IP;
 }
-EOF3
+EOF
 
-systemctl restart nginx
+log "${GREEN}[3/4] 重启 NGINX...${NC}"
+sudo systemctl restart nginx || { log "NGINX 重启失败"; exit 1; }
 
-# Step 8: 显示验证信息
-echo -e "\n\033[1;34m[完成] 所有操作已执行，请输入以下命令验证：\033[0m"
-echo -e "1. uname -r"
-echo -e "2. sysctl net.ipv4.tcp_congestion_control"
-echo -e "3. nginx -v"
-echo -e "\033[1;33m请执行 sudo reboot 重启系统以应用新内核。\033[0m"
+log "${GREEN}[4/4] 优化完成，NGINX 版本：$(nginx -v 2>&1)${NC}"
