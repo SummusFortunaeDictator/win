@@ -1,49 +1,104 @@
 #!/bin/bash
-# 一键安装 BBRPlus DKMS 模块（Ubuntu 22.04，无需切换内核）
-set -e
+set -euo pipefail
 
-echo "======== 开始安装 BBRPlus DKMS 模块（基于 hrimfaxi/tcp_bbr_modules） ========"
+LOGFILE="/var/log/bbrplus_install.log"
+exec 2>>"$LOGFILE"
 
-read -p "是否继续安装？[Y/N]: " confirm
-if [[ $confirm != "Y" && $confirm != "y" ]]; then
-  echo "操作已取消"
+GREEN="\033[1;32m"
+CYAN="\033[1;36m"
+YELLOW="\033[1;33m"
+RED="\033[1;31m"
+NC="\033[0m"
+
+function log() {
+  echo -e "$1" | tee -a "$LOGFILE"
+}
+
+log "${CYAN}======== BBRPlus DKMS 自动安装脚本 ========${NC}"
+log "${GREEN}当前系统内核：$(uname -r)${NC}"
+
+read -p "是否继续安装 BBRPlus DKMS 模块？[Y/N]: " confirm
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  log "${YELLOW}安装已取消${NC}"
   exit 1
 fi
 
-# 1. 安装依赖
-echo "[1/6] 安装依赖包 dkms, build-essential, linux-headers, unzip, wget ..."
-sudo apt update
-sudo apt install -y dkms build-essential linux-headers-$(uname -r) unzip wget
+log "${GREEN}[1/8] 安装依赖包...${NC}"
+sudo apt update -y
+sudo apt install -y dkms build-essential linux-headers-$(uname -r) wget unzip || {
+  log "${RED}错误：依赖安装失败，请检查网络或apt源${NC}"
+  exit 1
+}
 
-# 2. 下载并解压源码 ZIP
-echo "[2/6] 下载源码 ZIP..."
+log "${GREEN}[2/8] 清理旧模块（若存在）...${NC}"
+if dkms status | grep -q "tcp_bbrplus, 0.1"; then
+  sudo dkms remove tcp_bbrplus/0.1 --all && log "${GREEN}旧模块已卸载${NC}"
+  sudo rm -rf /usr/src/tcp_bbrplus-0.1
+else
+  log "${GREEN}未检测到旧模块，跳过${NC}"
+fi
+
+log "${GREEN}[3/8] 下载源码（最多重试3次）...${NC}"
 TMPDIR=$(mktemp -d)
-wget -qO "$TMPDIR/tcp_bbr_modules.zip" \
-  https://github.com/hrimfaxi/tcp_bbr_modules/archive/refs/heads/main.zip
+ZIPURL="https://github.com/KozakaiAya/TCP_BBR/archive/refs/heads/master.zip"
+for i in {1..3}; do
+  if wget -qO "$TMPDIR/tcp_bbrplus.zip" "$ZIPURL"; then
+    log "${GREEN}源码下载成功（第${i}次）${NC}"
+    break
+  else
+    log "${YELLOW}下载失败，第${i}次重试...${NC}"
+    sleep 2
+  fi
+  [[ $i -eq 3 ]] && {
+    log "${RED}错误：源码下载失败，请检查网络或URL${NC}"
+    exit 1
+  }
+done
 
-echo "[3/6] 解压到 /usr/src/tcp_bbrplus-0.1 ..."
+log "${GREEN}[4/8] 解压源码并准备 DKMS 目录...${NC}"
 sudo rm -rf /usr/src/tcp_bbrplus-0.1
-sudo unzip -q "$TMPDIR/tcp_bbr_modules.zip" -d /usr/src/
-sudo mv /usr/src/tcp_bbr_modules-main /usr/src/tcp_bbrplus-0.1
+sudo unzip -q "$TMPDIR/tcp_bbrplus.zip" -d /usr/src/
+sudo mv /usr/src/TCP_BBR-master /usr/src/tcp_bbrplus-0.1
 rm -rf "$TMPDIR"
 
-# 3. 添加到 DKMS
-echo "[4/6] dkms add 模块..."
-sudo dkms add -m tcp_bbrplus -v 0.1
+log "${GREEN}[5/8] 生成 dkms.conf...${NC}"
+sudo tee /usr/src/tcp_bbrplus-0.1/dkms.conf > /dev/null << 'EOF'
+PACKAGE_NAME="tcp_bbrplus"
+PACKAGE_VERSION="0.1"
+MAKE[0]="make -C ./code tcp_bbrplus.ko"
+BUILT_MODULE_NAME[0]="tcp_bbrplus"
+DEST_MODULE_LOCATION[0]="/kernel/net/ipv4/"
+AUTOINSTALL="yes"
+EOF
 
-# 4. 编译并安装
-echo "[5/6] dkms build && install 模块..."
-sudo dkms build -m tcp_bbrplus -v 0.1
+log "${GREEN}[6/8] 添加并构建 DKMS 模块...${NC}"
+sudo dkms add -m tcp_bbrplus -v 0.1
+sudo dkms build -m tcp_bbrplus -v 0.1 || {
+  log "${RED}错误：模块构建失败，查看 $LOGFILE/make.log 获取详情${NC}"
+  exit 1
+}
 sudo dkms install -m tcp_bbrplus -v 0.1
 
-# 5. 加载模块并配置 sysctl
-echo "[6/6] 加载模块 tcp_bbrplus 并配置加速参数..."
-sudo modprobe tcp_bbrplus
-sudo tee -a /etc/sysctl.conf << 'EOF'
+log "${GREEN}[7/8] 加载模块并设置 sysctl...${NC}"
+if lsmod | grep -q tcp_bbrplus; then
+  log "${YELLOW}模块已加载，跳过 modprobe${NC}"
+else
+  sudo modprobe tcp_bbrplus
+fi
+
+# 去重追加 sysctl
+if ! grep -q "net.ipv4.tcp_congestion_control.*bbrplus" /etc/sysctl.conf; then
+  sudo tee -a /etc/sysctl.conf > /dev/null << EOF
+
+# BBRPlus 加速配置
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbrplus
+net.ipv4.tcp_congestion_control = tcp_bbrplus
 EOF
+fi
 sudo sysctl -p
 
-echo -e "\n\033[1;32m安装完成！当前拥塞控制算法：\033[0m$(sysctl net.ipv4.tcp_congestion_control)"
-echo "如果一切正常，你已成功启用 BBRPlus，无需切换内核。"
+log "${GREEN}[8/8] 安装完成！${NC}"
+log "${GREEN}当前拥塞控制算法：$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')${NC}"
+log "${YELLOW}建议重启系统后，确保模块完全生效：sudo reboot${NC}"
+
+exit 0
